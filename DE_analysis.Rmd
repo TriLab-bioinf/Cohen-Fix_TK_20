@@ -1,0 +1,215 @@
+---
+title: "Differential expression analysis of yeast cells exposed or not to alpha factor"
+author: "Hernan Lorenzi"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+gemoetry: margin=1in
+fontsize: 8pt
+fontfamily: mathpazo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, tidy = TRUE)
+```
+
+# Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(cowplot)
+library(ggpubr)
+library("RColorBrewer")
+library(pheatmap)
+library(ggsci)
+library(BSgenome)
+library("org.Sc.sgd.db")
+library("AnnotationDbi")
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(enrichplot)
+library(ggupset)
+```
+
+# Load useful functions
+```{r}
+source("01_aux_rnaseq_functions.R")
+source("02_Gene_enrichment_functions.R")
+```
+
+
+# Load data
+```{r}
+# Import read counts table
+read_counts <- read.table(file = "data/read_counts_all.txt", header = TRUE, row.names = 1, sep = "\t")
+
+# round read counts to the closest integer
+read_counts <- round(read_counts, digits = 0)
+
+# Read metadata table
+metadata <- read.table(file = "data/metadata.txt", header = TRUE, row.names = 1, sep = "\t")
+
+# Change metadata row names to match read_count's column names 
+rownames(metadata) <- colnames(read_counts)
+
+# Sort tables so metadata and read counts match order
+read_counts <- read_counts[,match(rownames(metadata), colnames(read_counts))]
+
+# include total read counts in metadata
+metadata$read_counts <- colSums(read_counts)
+
+# include sample ids in metadata as a variable (column)
+metadata$sample_id <- c("VM-1", "VM-2", "VM-3", "VM-4")
+
+```
+
+# DE analysis with DESeq2
+```{r}
+dir.create(path = "./Plots", showWarnings = FALSE)
+
+# Adding read_depth in design to control for read_depth
+dds <- DESeqDataSetFromMatrix(countData = read_counts, 
+                              colData = metadata,  
+                              design = ~ strain + treatment)
+
+
+# Plot total reads per sample using barchar
+p <- ggbarplot(data = metadata, 
+          x = "sample_id", 
+          y = "read_counts",
+          x.text.angle = 90,
+          fill = "treatment", 
+          title = "Total read counts per sample", 
+          ylab = "Read counts",
+          sort.by.groups = TRUE,
+          palette = c("red","orange"), #"jco",
+          sort.val = "asc")
+
+ggsave2("Plots/barplot_read_counts_per_sample.pdf", plot = p)
+
+# Normalize counts
+dds.vst <- vst(dds, blind=FALSE)
+
+# Keep genes with at least 20 reads total across samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 20
+dds.vst <- dds.vst[keep,]
+
+# Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# Plot inter-sample distances
+old.par <- par(no.readonly=T)
+
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+#colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+p.hm <- pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+ggsave2(filename = "./Plots/heat_map.pdf", plot = p.hm)
+p.hm
+
+# PCA
+pcaData <- plotPCA(dds.vst, intgroup=c("treatment"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+y.coords = c(min(pcaData$PC1, pcaData$PC2), max(pcaData$PC1, pcaData$PC2))
+x.coords = y.coords
+p1 <- ggplot(pcaData, aes(PC1, PC2, color=treatment)) +
+  geom_point(size=3) + scale_color_lancet() + 
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed(ratio = (max(pcaData$PC1)-min(pcaData$PC1))/(max(pcaData$PC2)-min(pcaData$PC2))) 
+
+ggsave("Plots/pca_by_group.pdf", plot = p1)
+p1
+
+```
+# Run DE analysis
+```{r}
+
+dir.create(path = "./DE", showWarnings = FALSE)
+
+# define list element to store DE results
+DE_results = list()
+
+# Calculate DE for WT samples
+dds$treatment <- relevel(dds$treatment, "none")
+dds <- DESeq(dds)
+resultsNames(dds)
+
+
+# Using lfcShrink instead of results to reduce high Log2FC bias of genes with low expression
+res_treatment_vs_control <- lfcShrink(dds, 
+                                   coef = "treatment_alpha_factor_vs_none", 
+                                   type = "ashr", )
+
+# Replace NAs by 1s
+res_treatment_vs_control$pvalue[is.na(res_treatment_vs_control$pvalue)] <- 1
+res_treatment_vs_control$padj[is.na(res_treatment_vs_control$padj)] <- 1
+
+summary(res_treatment_vs_control, alpha = 0.05)
+
+res_treatment_vs_control$gene_names <- get_gene_names_from_gene_ids(ensemble_ids =  rownames(res_treatment_vs_control), annotation_db = org.Sc.sgd.db, look_for = 'ENSEMBL', fetch = 'GENENAME')
+
+# Sort result table based on adj.p (ascending)
+res_treatment_vs_control <- res_treatment_vs_control[order(res_treatment_vs_control$padj, decreasing = F), ]
+# Save DE results
+write.table(x = as.data.frame(res_treatment_vs_control), 
+            file = "./DE/DE_treatment_vs_control.txt", sep = "\t", col.names=NA)
+
+DE_results["res_treatment_vs_control"] <- res_treatment_vs_control
+
+```
+
+# Volcano plots
+```{r volcano plot}
+generate_volcano_plot(res.tmp = res_treatment_vs_control, my_file_name = "volcano_plot.pdf")
+```
+
+
+# GO enrichment analysis
+```{r GO enrichment}
+# The code below selects a list of gene IDs based on a specific Log2FC cutoff for running Overrepresentation analysis with the R function 'enricher'. The list of genes are stored in the variable "gene" for gene IDs = Ensembl gene IDs, and in the variable  'gene.entrezid' for a list of Entrez gene IDs. Usually, geneset databases use eithr Entrez gene IDs or gene symbols as identifiers, so in some cases it is handy to count with a list of genes using Entrez gene IDs. 
+
+#The same code also extract the entire list of genes used for the Differential Expression Analysis as an R list element, using Ensemble gene IDs as keys (names) and Log2FC as values. This geneList is used as input for running Gene Set Enrichment Analysis with the function 'GSEA'. If needed, the code below also generates the same geneList but using Entrez gene IDs as keys.
+
+go.class = list()
+go.overrep = list()
+go.gsea = list()
+
+for (i in names(DE_results)){
+ 
+  dir.create(path = paste0("./GO/", i), showWarnings = FALSE, recursive = TRUE)
+
+  for (ontho in c("BP", "MF", "CC")){ 
+    my_id = paste0(i,"_",ontho)
+    
+    print(paste("go_classification", i, ontho))
+    go.class[[my_id]] <- go_classification(dds_res = DE_results[[i]], 
+                             my_file = i, 
+                             onthology = ontho)
+    
+    print(paste("go_overrep", i, ontho))
+    go.overrep[[my_id]] <- go_overrep(dds_res = DE_results[[i]], 
+                                   my_file = i, 
+                                   onthology = ontho)
+    
+    print(paste("go_gsea", i, ontho))
+    go.gsea[[my_id]] <- go_gsea(dds_res = DE_results[[i]], 
+                                   my_file = i, 
+                                   onthology = ontho, qvalue = 0.05)
+  }
+}
+
+
+```
+
+
+
+```{r}
+sessionInfo()
+```

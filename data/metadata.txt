@@ -1,0 +1,5 @@
+sample_id	group	treatment	strain
+VM-1	control	none	VM05.1.1
+VM-2	treatment	alpha_factor	VM05.1.1
+VM-3	control	none	VM05.3.1
+VM-4	treatment	alpha_factor	VM05.3.1
